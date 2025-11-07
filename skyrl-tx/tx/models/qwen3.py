@@ -2,10 +2,10 @@ from flax import nnx
 import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
-from transformers import Qwen3Config
 
 from tx.layers.lora import LoRAExpert, LoRALinear
 from tx.layers.util import Param, prepare_routing
+from tx.models.configs import Qwen3ConfigWithLoRA
 from tx.models.outputs import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
 
@@ -33,20 +33,20 @@ def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta:
 
 class Qwen3Attention(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         tp = get_abstract_mesh().shape.get("tp", 1)
-        shard_attention_heads = getattr(config, "shard_attention_heads", True)
+        shard_attention_heads = config.shard_attention_heads
         if shard_attention_heads:
             assert self.num_heads % tp == 0, f"num_heads={self.num_heads} must be divisible by tp={tp}"
             assert self.num_kv_heads % tp == 0, f"num_kv_heads={self.num_kv_heads} must be divisible by tp={tp}"
         tp_shard = "tp" if shard_attention_heads else None
 
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
-        max_lora_adapters = getattr(config, "max_lora_adapters", 0)
-        max_lora_rank = getattr(config, "max_lora_rank", 8)
+        self.head_dim = config.head_dim if hasattr(config, "head_dim") and config.head_dim else config.hidden_size // self.num_heads
+        max_lora_adapters = config.max_lora_adapters
+        max_lora_rank = config.max_lora_rank
 
         self.q_proj = LoRALinear(
             in_features=config.hidden_size,
@@ -140,9 +140,9 @@ class Qwen3Attention(nnx.Module):
 
 class Qwen3MLP(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
-        max_lora_adapters = getattr(config, "max_lora_adapters", 0)
-        max_lora_rank = getattr(config, "max_lora_rank", 8)
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+        max_lora_adapters = config.max_lora_adapters
+        max_lora_rank = config.max_lora_rank
         self.gate_proj = LoRALinear(
             config.hidden_size,
             config.intermediate_size,
@@ -185,10 +185,10 @@ class Qwen3MLP(nnx.Module):
 
 class Qwen3Experts(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
-        max_lora_adapters = getattr(config, "max_lora_adapters", 0)
-        max_lora_rank = getattr(config, "max_lora_rank", 8)
+        max_lora_adapters = config.max_lora_adapters
+        max_lora_rank = config.max_lora_rank
 
         self.gate_proj = LoRAExpert(
             config.num_experts,
@@ -254,7 +254,7 @@ class Qwen3Experts(nnx.Module):
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
         self.gate = nnx.Linear(
             config.hidden_size,
@@ -291,7 +291,7 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
 
 class Qwen3DecoderLayer(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
         self.self_attn = Qwen3Attention(config, dtype=dtype, rngs=rngs)
@@ -330,7 +330,7 @@ class Qwen3DecoderLayer(nnx.Module):
 
 class Qwen3Model(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
         self.embed_tokens = nnx.Embed(
             num_embeddings=config.vocab_size,
@@ -393,7 +393,7 @@ class Qwen3Model(nnx.Module):
 
 class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3ConfigWithLoRA, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
         self.model = Qwen3Model(config, dtype=dtype, rngs=rngs)
         if not self.config.tie_word_embeddings:
